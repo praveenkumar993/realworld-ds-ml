@@ -6,3 +6,8 @@ __pycache__/
 *.xlsx
 data/raw/
 data/processed/
+# Model files
+models/
+*.pkl
+*.joblib
+*.h5
