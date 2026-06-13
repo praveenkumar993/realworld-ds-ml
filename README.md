@@ -98,7 +98,7 @@ Simulating data from a platform like Ola, Uber, or Rapido.
 
 | Project | Problem Type | Status |
 |---|---|---|
-| Surge Pricing Prediction | Regression | 🔄 In Progress |
+| Surge Pricing Prediction | Regression | ✅ Completed |
 | Driver Churn Prediction | Classification | 🔜 Upcoming |
 | Ride Cancellation Prediction | Classification | 🔜 Upcoming |
 | ETA Prediction | Regression | 🔜 Upcoming |
@@ -168,11 +168,11 @@ Simulating transaction and customer data for banking and fintech.
 
 | Domain | Projects Completed | Total Planned |
 |---|---|---|
-| Ride Sharing | 0 | 5 |
+| Ride Sharing | 1 | 5 |
 | Healthcare | 0 | 3 |
 | E-Commerce | 0 | 4 |
 | Finance | 0 | 3 |
-| **Total** | **0** | **15** |
+| **Total** | **1** | **15** |
 
 ---
 
