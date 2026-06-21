@@ -272,100 +272,100 @@ def decide_ride_outcome(
     # Each factor independently contributes to the driver's
     # likelihood of cancelling
 
-    driver_cancel_prob = 0.08   # base rate ~8%
+    driver_cancel_prob = 0.025   # base rate ~2.5%
 
     # Long pickup distance — primary driver for driver cancellation
-    if driver_distance_km > 5:
-        driver_cancel_prob += 0.15
+    if driver_distance_km > 8:
+        driver_cancel_prob += 0.10
+    elif driver_distance_km > 5:
+        driver_cancel_prob += 0.05
     elif driver_distance_km > 3:
-        driver_cancel_prob += 0.08
-    elif driver_distance_km > 1.5:
-        driver_cancel_prob += 0.03
+        driver_cancel_prob += 0.02
 
     # Already cancelled multiple times today — habit/burnout
     if driver_cancellations_today >= 4:
-        driver_cancel_prob += 0.20
+        driver_cancel_prob += 0.12
     elif driver_cancellations_today >= 2:
-        driver_cancel_prob += 0.10
+        driver_cancel_prob += 0.05
     elif driver_cancellations_today == 1:
-        driver_cancel_prob += 0.04
+        driver_cancel_prob += 0.02
 
     # Low acceptance rate driver — generally unreliable
     if driver_acceptance_rate is not None:
         if driver_acceptance_rate < 0.6:
-            driver_cancel_prob += 0.12
+            driver_cancel_prob += 0.07
         elif driver_acceptance_rate < 0.75:
-            driver_cancel_prob += 0.05
+            driver_cancel_prob += 0.02
 
     # Low user rating — driver cherry picks good users
     if user_rating is not None:
         if user_rating < 3.5:
-            driver_cancel_prob += 0.15
+            driver_cancel_prob += 0.08
         elif user_rating < 4.0:
-            driver_cancel_prob += 0.06
+            driver_cancel_prob += 0.03
 
     # Peak hour — better rides available nearby
     if hour in range(8, 11) or hour in range(17, 21):
-        driver_cancel_prob += 0.06
+        driver_cancel_prob += 0.025
 
     # Zone risk — MG Road, BTM Layout have higher cancellation
     zone_risk = ZONE_CANCELLATION_RISK.get(pickup_zone, 0.6)
-    driver_cancel_prob += (zone_risk - 0.6) * 0.2
+    driver_cancel_prob += (zone_risk - 0.6) * 0.08
 
     # Random noise
-    driver_cancel_prob += random.uniform(-0.02, 0.03)
-    driver_cancel_prob  = np.clip(driver_cancel_prob, 0, 0.70)
+    driver_cancel_prob += random.uniform(-0.01, 0.015)
+    driver_cancel_prob  = np.clip(driver_cancel_prob, 0, 0.55)
 
     # ── USER CANCELLATION PROBABILITY ────────────────────────
-    user_cancel_prob = 0.12   # base rate ~12%
+    user_cancel_prob = 0.04   # base rate ~4%
 
     # Long wait time — most common user cancellation reason
-    if estimated_wait_time > 15:
-        user_cancel_prob += 0.25
-    elif estimated_wait_time > 10:
-        user_cancel_prob += 0.15
-    elif estimated_wait_time > 7:
-        user_cancel_prob += 0.07
+    if estimated_wait_time > 18:
+        user_cancel_prob += 0.16
+    elif estimated_wait_time > 12:
+        user_cancel_prob += 0.09
+    elif estimated_wait_time > 8:
+        user_cancel_prob += 0.04
 
     # High surge — price shock after booking
     if surge_at_booking > 2.5:
-        user_cancel_prob += 0.20
-    elif surge_at_booking > 2.0:
         user_cancel_prob += 0.12
+    elif surge_at_booking > 2.0:
+        user_cancel_prob += 0.07
     elif surge_at_booking > 1.5:
-        user_cancel_prob += 0.05
+        user_cancel_prob += 0.025
 
     # Habitual canceller — user's historical behavior
     if user_cancellations_last_30d >= 8:
-        user_cancel_prob += 0.22
+        user_cancel_prob += 0.14
     elif user_cancellations_last_30d >= 4:
-        user_cancel_prob += 0.12
+        user_cancel_prob += 0.07
     elif user_cancellations_last_30d >= 2:
-        user_cancel_prob += 0.05
+        user_cancel_prob += 0.03
 
     # Indecisive user — opened app many times before booking
     if user_booking_attempts >= 4:
-        user_cancel_prob += 0.15
+        user_cancel_prob += 0.09
     elif user_booking_attempts >= 2:
-        user_cancel_prob += 0.07
+        user_cancel_prob += 0.04
 
     # Rain — user may find auto/walk better
     if weather_condition in ["Heavy Rain", "Storm"]:
-        user_cancel_prob += 0.08
-    elif weather_condition == "Light Rain":
         user_cancel_prob += 0.04
+    elif weather_condition == "Light Rain":
+        user_cancel_prob += 0.02
 
     # Late night — some users cancel out of safety concerns
     if hour in range(23, 24) or hour in range(0, 3):
-        user_cancel_prob += 0.05
+        user_cancel_prob += 0.025
 
     # Holiday — users more likely to find alternate plans
     if is_holiday:
-        user_cancel_prob += 0.06
+        user_cancel_prob += 0.03
 
     # Random noise
-    user_cancel_prob += random.uniform(-0.02, 0.03)
-    user_cancel_prob  = np.clip(user_cancel_prob, 0, 0.75)
+    user_cancel_prob += random.uniform(-0.01, 0.015)
+    user_cancel_prob  = np.clip(user_cancel_prob, 0, 0.60)
 
     # ── DECIDE FINAL OUTCOME ──────────────────────────────────
     # Both driver and user make independent decisions
@@ -627,8 +627,17 @@ def generate_rides(drivers_df, users_df, weather_df):
     user_ids   = users_df["user_id"].tolist()
 
     # Build lookup dicts for fast driver/user attribute access
-    driver_lookup = drivers_df.drop_duplicates(subset="driver_id", keep="first").set_index("driver_id").to_dict("index")
-    user_lookup   = users_df.drop_duplicates(subset="user_id", keep="first").set_index("user_id").to_dict("index")
+    # drop_duplicates on ID first — duplicate ID rows would break to_dict("index")
+    driver_lookup = (
+        drivers_df.drop_duplicates(subset=["driver_id"])
+                  .set_index("driver_id")
+                  .to_dict("index")
+    )
+    user_lookup = (
+        users_df.drop_duplicates(subset=["user_id"])
+                .set_index("user_id")
+                .to_dict("index")
+    )
 
     # Build weather index for fast lookup
     weather_index = {}
