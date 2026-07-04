@@ -36,7 +36,7 @@ realworld-ds-ml/
 ├── ecommerce/             # Flipkart / Amazon style problems
 ├── finance/               # Fraud detection, risk scoring, forecasting
 │
-└── README.md              # You are here
+└── README.md              # We are here
 ```
 
 > **Note:** Each domain folder will be populated progressively as work is completed. Every subfolder represents one complete end-to-end project — from raw data generation to final model evaluation.
