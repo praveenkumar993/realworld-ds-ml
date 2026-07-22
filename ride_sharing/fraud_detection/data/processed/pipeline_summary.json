@@ -1,0 +1,16 @@
+{
+  "stage1_model": "LightGBM",
+  "stage1_threshold": 0.6994,
+  "stage1_avg_precision": 0.8794893389214505,
+  "stage1_recall": 0.8114754098360656,
+  "stage1_precision": 0.8892215568862275,
+  "stage2_model": "Logistic Regression",
+  "stage2_macro_f1": 1.0,
+  "pipeline_fraud_caught_pct": 81.14754098360656,
+  "pipeline_false_alarm_pct": 0.31803335052432524,
+  "total_test_transactions": 12000,
+  "total_fraud_in_test": 366,
+  "fraud_caught": 297,
+  "fraud_escaped": 69,
+  "false_alarms": 37
+}
