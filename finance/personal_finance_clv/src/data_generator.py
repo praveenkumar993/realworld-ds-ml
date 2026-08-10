@@ -48,6 +48,7 @@ from faker import Faker
 import random
 from datetime import datetime, timedelta, date
 import os
+import time
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -70,6 +71,10 @@ LABEL_END     = date(2024, 12, 31)
 
 DB_PATH = os.path.join(
     os.path.dirname(__file__), "..", "data", "finance_clv.db"
+)
+DB_FALLBACK_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "data",
+    f"finance_clv_{os.getpid()}_{int(time.time())}.db"
 )
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
@@ -168,6 +173,52 @@ def random_date(start: date, end: date) -> date:
     """Random date between start and end."""
     delta = (end - start).days
     return start + timedelta(days=random.randint(0, delta))
+
+
+def create_transactions_table(conn, table_name: str):
+    """Create or replace the transaction table for a fresh run."""
+    conn.execute("PRAGMA busy_timeout = 60000")
+    conn.execute("PRAGMA journal_mode = DELETE")
+
+    for attempt in range(3):
+        try:
+            conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+            conn.execute(f"""
+                CREATE TABLE {table_name} (
+                    txn_id TEXT PRIMARY KEY,
+                    customer_id TEXT,
+                    txn_date TEXT,
+                    txn_type TEXT,
+                    amount REAL,
+                    credit_debit TEXT,
+                    merchant_category TEXT,
+                    channel TEXT,
+                    balance_after REAL,
+                    city TEXT,
+                    is_international INTEGER
+                )
+            """)
+            conn.commit()
+            return
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and attempt < 2:
+                time.sleep(2)
+                continue
+            raise
+
+
+def insert_records_to_sqlite(conn, table_name: str, records: list):
+    """Insert a batch of transaction dictionaries into SQLite."""
+    if not records:
+        return
+
+    columns = list(records[0].keys())
+    placeholders = ", ".join("?" for _ in columns)
+    column_sql = ", ".join(columns)
+    sql = f"INSERT INTO {table_name} ({column_sql}) VALUES ({placeholders})"
+    values = [tuple(r[c] for c in columns) for r in records]
+    conn.executemany(sql, values)
+    conn.commit()
 
 
 def get_city_and_tier():
@@ -520,30 +571,34 @@ def generate_products(customers_df):
 # ================================================================
 
 def generate_transactions(customers_df, start_date, end_date,
-                           table_suffix="history"):
+                           table_suffix="history", conn=None,
+                           table_name=None):
     """
     Generate transaction records for all customers
     between start_date and end_date.
 
-    This generates approximately 3 million rows for the
-    history period — genuinely PySpark-scale data.
+    Transactions are streamed directly to SQLite so the
+    process avoids allocating a giant in-memory pandas frame.
     """
     print(f"Generating transactions_{table_suffix} table...")
     print(f"  Period: {start_date} to {end_date}")
     print(f"  Estimated rows: ~{N_CUSTOMERS * 5 * 12:,}")
 
-    records    = []
+    if conn is not None:
+        table_name = table_name or f"transactions_{table_suffix}"
+        create_transactions_table(conn, table_name)
+
+    records = []
     txn_counter = 0
+    total_rows = 0
 
     customers_clean = customers_df.drop_duplicates(
         subset=["customer_id"]
     ).reset_index(drop=True)
 
-    # Generate month by month for each customer
     current_month = date(start_date.year, start_date.month, 1)
-    end_month     = date(end_date.year, end_date.month, 1)
+    end_month = date(end_date.year, end_date.month, 1)
 
-    # Build month list
     months = []
     m = current_month
     while m <= end_month:
@@ -553,29 +608,22 @@ def generate_transactions(customers_df, start_date, end_date,
         else:
             m = date(m.year, m.month + 1, 1)
 
-    for _, cust in customers_clean.iterrows():
-        cust_id = cust["customer_id"]
-        segment = cust["segment"]
-        income  = cust["monthly_income"] or 30000
-        tier    = cust["city_tier"]
-        digital = cust["digital_score"] or 5
+    for customer_idx, cust in enumerate(customers_clean.itertuples(), start=1):
+        cust_id = cust.customer_id
+        segment = cust.segment
+        income = cust.monthly_income or 30000
+        tier = cust.city_tier
+        digital = cust.digital_score or 5
 
         base_txn_count = monthly_txn_count(segment, tier)
-
-        # Running balance — starts at a reasonable level
         balance = round(income * random.uniform(0.5, 3.0), 2)
 
         for month_start in months:
-            # Some customers become inactive in certain months
             if random.random() < 0.03:
                 continue
 
-            # Monthly transaction count with some variance
-            n_txns = max(
-                1, int(base_txn_count * random.uniform(0.7, 1.3))
-            )
+            n_txns = max(1, int(base_txn_count * random.uniform(0.7, 1.3)))
 
-            # Salary credit in first week of month
             if segment not in ["student", "retired"]:
                 salary_date = date(
                     month_start.year, month_start.month,
@@ -584,22 +632,20 @@ def generate_transactions(customers_df, start_date, end_date,
                 balance += income
                 txn_counter += 1
                 records.append({
-                    "txn_id"          : f"TXN{txn_counter:010d}",
-                    "customer_id"     : cust_id,
-                    "txn_date"        : salary_date.isoformat(),
-                    "txn_type"        : "NetBanking",
-                    "amount"          : income,
-                    "credit_debit"    : "CR",
+                    "txn_id": f"TXN{txn_counter:010d}",
+                    "customer_id": cust_id,
+                    "txn_date": salary_date.isoformat(),
+                    "txn_type": "NetBanking",
+                    "amount": income,
+                    "credit_debit": "CR",
                     "merchant_category": "salary_credit",
-                    "channel"         : "netbanking",
-                    "balance_after"   : round(balance, 2),
-                    "city"            : cust["city"],
+                    "channel": "netbanking",
+                    "balance_after": round(balance, 2),
+                    "city": cust.city,
                     "is_international": False,
                 })
 
-            # Regular transactions
             for _ in range(n_txns):
-                # Pick transaction type (digital-biased)
                 txn_weights = []
                 for ttype, tinfo in TXN_TYPES.items():
                     w = tinfo["weight"]
@@ -615,31 +661,22 @@ def generate_transactions(customers_df, start_date, end_date,
                 )[0]
                 txn_info = TXN_TYPES[txn_type]
 
-                # Amount based on type and income
                 base_amt = txn_info["avg_amount"]
-                amount   = round(
-                    abs(np.random.lognormal(
-                        np.log(base_amt), 0.8
-                    )), 2
+                amount = round(
+                    abs(np.random.lognormal(np.log(base_amt), 0.8)), 2
                 )
                 amount = max(1.0, min(amount, income * 10))
 
-                # Date within the month
                 if month_start.month == 12:
                     next_month = date(month_start.year + 1, 1, 1)
                 else:
-                    next_month = date(
-                        month_start.year, month_start.month + 1, 1
-                    )
+                    next_month = date(month_start.year, month_start.month + 1, 1)
                 txn_date = random_date(
                     month_start,
                     min(next_month - timedelta(days=1), end_date)
                 )
 
-                # Credit or debit
-                credit_debit = "CR" if txn_type in [
-                    "NetBanking"
-                ] and random.random() < 0.2 else "DR"
+                credit_debit = "CR" if txn_type in ["NetBanking"] and random.random() < 0.2 else "DR"
 
                 if credit_debit == "DR":
                     balance = max(0, balance - amount)
@@ -660,7 +697,6 @@ def generate_transactions(customers_df, start_date, end_date,
                              0.10, 0.05, 0.10]
                 )[0]
 
-                # Inject occasional nulls
                 if random.random() < 0.02:
                     merchant_cat = None
                 if random.random() < 0.015:
@@ -668,36 +704,41 @@ def generate_transactions(customers_df, start_date, end_date,
 
                 txn_counter += 1
                 records.append({
-                    "txn_id"          : f"TXN{txn_counter:010d}",
-                    "customer_id"     : cust_id,
-                    "txn_date"        : txn_date.isoformat(),
-                    "txn_type"        : txn_type,
-                    "amount"          : amount,
-                    "credit_debit"    : credit_debit,
+                    "txn_id": f"TXN{txn_counter:010d}",
+                    "customer_id": cust_id,
+                    "txn_date": txn_date.isoformat(),
+                    "txn_type": txn_type,
+                    "amount": amount,
+                    "credit_debit": credit_debit,
                     "merchant_category": merchant_cat,
-                    "channel"         : channel,
-                    "balance_after"   : round(balance, 2),
-                    "city"            : cust["city"],
+                    "channel": channel,
+                    "balance_after": round(balance, 2),
+                    "city": cust.city,
                     "is_international": random.random() < 0.02,
                 })
 
-        # Print progress every 10,000 customers
-        if (_ + 1) % 10000 == 0:
-            print(f"    Processed {_+1:,} customers, "
-                  f"{len(records):,} transactions so far...")
+        if customer_idx % 10_000 == 0:
+            print(f"    Processed {customer_idx:,} customers, "
+                  f"{len(records):,} transactions buffered...")
 
-    df = pd.DataFrame(records)
+        if len(records) >= 10_000:
+            if conn is not None:
+                insert_records_to_sqlite(conn, table_name, records)
+                total_rows += len(records)
+                records.clear()
 
-    # Inject ~0.3% duplicate transactions
-    dupes = df.sample(
-        frac=0.003, random_state=SEED
-    ).copy()
-    df = pd.concat([df, dupes], ignore_index=True)
-    df = df.sample(frac=1, random_state=SEED).reset_index(drop=True)
+    if records:
+        if conn is not None:
+            insert_records_to_sqlite(conn, table_name, records)
+            total_rows += len(records)
+            records.clear()
 
-    print(f"  → {len(df):,} rows | "
-          f"{df.isnull().sum().sum():,} null values")
-    return df
+    if conn is not None:
+        row_count = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+        print(f"  → {row_count:,} rows")
+        return None
+
+    return None
 
 
 # ================================================================
@@ -705,7 +746,8 @@ def generate_transactions(customers_df, start_date, end_date,
 # ================================================================
 
 def generate_clv_labels(customers_df, products_df,
-                         label_transactions_df):
+                         label_transactions_df=None, conn=None,
+                         table_name="transactions_label"):
     """
     Compute actual CLV for each customer over the label period
     (Jan 2024 - Dec 2024).
@@ -719,24 +761,30 @@ def generate_clv_labels(customers_df, products_df,
         subset=["customer_id"]
     )
 
-    # Index products and transactions for fast lookup
+    # Index products for fast lookup
     products_by_cust = products_df.groupby("customer_id")
-    label_txn_by_cust = label_transactions_df.groupby(
-        "customer_id"
-    )
 
     records = []
     for _, cust in customers_clean.iterrows():
         cust_id = cust["customer_id"]
 
-        # Get this customer's products and label transactions
+        # Get this customer's products
         prods = products_by_cust.get_group(cust_id) \
             if cust_id in products_by_cust.groups else \
             pd.DataFrame()
 
-        label_txns = label_txn_by_cust.get_group(cust_id) \
-            if cust_id in label_txn_by_cust.groups else \
-            pd.DataFrame()
+        if label_transactions_df is not None:
+            label_txns = label_transactions_df.loc[
+                label_transactions_df["customer_id"] == cust_id
+            ].copy()
+        elif conn is not None:
+            label_txns = pd.read_sql_query(
+                f"SELECT * FROM {table_name} WHERE customer_id = ?",
+                conn,
+                params=(cust_id,),
+            )
+        else:
+            label_txns = pd.DataFrame()
 
         clv = compute_clv(cust, prods, label_txns)
 
@@ -789,7 +837,7 @@ def generate_clv_labels(customers_df, products_df,
 #  WRITE TO SQLITE
 # ================================================================
 
-def write_to_sqlite(tables: dict, db_path: str):
+def write_to_sqlite(tables: dict, db_path: str, conn=None):
     """
     Write all DataFrames to SQLite tables.
     Creates indexes on primary and foreign keys for
@@ -797,11 +845,8 @@ def write_to_sqlite(tables: dict, db_path: str):
     """
     print(f"\nWriting to SQLite database: {db_path}")
 
-    if os.path.exists(db_path):
-        os.remove(db_path)
-        print("  Removed existing database")
-
-    conn = sqlite3.connect(db_path)
+    if conn is None:
+        conn = sqlite3.connect(db_path)
 
     for table_name, df in tables.items():
         print(f"  Writing {table_name}... ", end="")
@@ -832,7 +877,9 @@ def write_to_sqlite(tables: dict, db_path: str):
             print(f"    ⚠️ {e}")
 
     conn.commit()
-    conn.close()
+
+    if conn is not None and os.path.exists(db_path):
+        conn.close()
 
     # File size
     size_mb = os.path.getsize(db_path) / (1024 * 1024)
@@ -860,38 +907,58 @@ def main():
     print("=" * 65)
 
     # ── Generate all tables ───────────────────────────────────
-    customers_df = generate_customers()
-    products_df  = generate_products(customers_df)
+    target_db_path = DB_PATH
+    if os.path.exists(DB_PATH):
+        try:
+            probe_conn = sqlite3.connect(DB_PATH, timeout=2.0)
+            probe_conn.execute("SELECT 1")
+            probe_conn.close()
+        except sqlite3.OperationalError:
+            target_db_path = DB_FALLBACK_PATH
+            print(f"  Using alternate database path: {target_db_path}")
 
-    print("\nGenerating history transactions (2023)...")
-    history_txn_df = generate_transactions(
-        customers_df,
-        HISTORY_START, HISTORY_END,
-        table_suffix="history"
-    )
+    conn = sqlite3.connect(target_db_path, timeout=60.0)
+    conn.execute("PRAGMA busy_timeout = 60000")
+    conn.execute("PRAGMA journal_mode = DELETE")
 
-    print("\nGenerating label transactions (2024)...")
-    label_txn_df = generate_transactions(
-        customers_df,
-        LABEL_START, LABEL_END,
-        table_suffix="label"
-    )
+    try:
+        customers_df = generate_customers()
+        products_df  = generate_products(customers_df)
 
-    print("\nComputing CLV labels...")
-    clv_labels_df = generate_clv_labels(
-        customers_df, products_df, label_txn_df
-    )
+        print("\nGenerating history transactions (2023)...")
+        generate_transactions(
+            customers_df,
+            HISTORY_START, HISTORY_END,
+            table_suffix="history",
+            conn=conn,
+            table_name="transactions_history",
+        )
 
-    # ── Write to SQLite ───────────────────────────────────────
-    tables = {
-        "customers"           : customers_df,
-        "products"            : products_df,
-        "transactions_history": history_txn_df,
-        "transactions_label"  : label_txn_df,
-        "clv_labels"          : clv_labels_df,
-    }
+        print("\nGenerating label transactions (2024)...")
+        generate_transactions(
+            customers_df,
+            LABEL_START, LABEL_END,
+            table_suffix="label",
+            conn=conn,
+            table_name="transactions_label",
+        )
 
-    write_to_sqlite(tables, DB_PATH)
+        print("\nComputing CLV labels...")
+        clv_labels_df = generate_clv_labels(
+            customers_df, products_df, conn=conn,
+            table_name="transactions_label"
+        )
+
+        # ── Write to SQLite ─────────────────────────────────────
+        tables = {
+            "customers": customers_df,
+            "products": products_df,
+            "clv_labels": clv_labels_df,
+        }
+
+        write_to_sqlite(tables, target_db_path, conn=conn)
+    finally:
+        conn.close()
 
     # ── Final summary ─────────────────────────────────────────
     print()
@@ -900,8 +967,6 @@ def main():
     print("=" * 65)
     print(f"  customers            : {len(customers_df):>8,} rows")
     print(f"  products             : {len(products_df):>8,} rows")
-    print(f"  transactions_history : {len(history_txn_df):>8,} rows")
-    print(f"  transactions_label   : {len(label_txn_df):>8,} rows")
     print(f"  clv_labels           : {len(clv_labels_df):>8,} rows")
     print("=" * 65)
     print()
