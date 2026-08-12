@@ -48,6 +48,7 @@ from faker import Faker
 import random
 from datetime import datetime, timedelta, date
 import os
+import shutil
 import time
 import warnings
 warnings.filterwarnings("ignore")
@@ -69,7 +70,7 @@ HISTORY_END   = date(2023, 12, 31)
 LABEL_START   = date(2024, 1, 1)
 LABEL_END     = date(2024, 12, 31)
 
-DB_PATH = os.path.join(
+DB_PATH = os.environ.get("CLV_DB_PATH") or os.path.join(
     os.path.dirname(__file__), "..", "data", "finance_clv.db"
 )
 DB_FALLBACK_PATH = os.path.join(
@@ -77,6 +78,58 @@ DB_FALLBACK_PATH = os.path.join(
     f"finance_clv_{os.getpid()}_{int(time.time())}.db"
 )
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
+# Measured from real runs: ~95 KB/customer for the finished database
+# (all tables + indexes) at this row-per-customer ratio. SQLite also
+# needs headroom beyond the final size while writing (rollback
+# journal pages, index build scratch space), so we ask for a
+# generous multiple of the projected final size before starting —
+# far cheaper to fail in one second here than after minutes of
+# writing millions of transaction rows.
+BYTES_PER_CUSTOMER_ESTIMATE = 95_000
+DISK_SPACE_SAFETY_MULTIPLIER = 2.0
+
+
+def check_disk_space(target_path: str, n_customers: int):
+    """
+    Abort early with a clear message if the target drive doesn't
+    have enough free space for the run, rather than crashing with
+    a cryptic 'database or disk is full' partway through a
+    multi-minute transaction-generation phase.
+    """
+    target_dir = os.path.dirname(os.path.abspath(target_path)) or "."
+    try:
+        free_bytes = shutil.disk_usage(target_dir).free
+    except OSError:
+        # Can't stat the drive (unusual) — don't block the run over it.
+        return
+
+    projected_bytes = n_customers * BYTES_PER_CUSTOMER_ESTIMATE
+    required_bytes = int(projected_bytes * DISK_SPACE_SAFETY_MULTIPLIER)
+
+    if free_bytes < required_bytes:
+        free_gb = free_bytes / (1024 ** 3)
+        required_gb = required_bytes / (1024 ** 3)
+        raise SystemExit(
+            f"\n❌ Not enough free disk space on the drive for "
+            f"'{target_dir}'.\n"
+            f"   Free space   : {free_gb:.2f} GB\n"
+            f"   Estimated need: ~{required_gb:.2f} GB "
+            f"(for {n_customers:,} customers)\n\n"
+            f"   Options:\n"
+            f"   1. Delete any partial .db file from a previous "
+            f"failed run in that folder — SQLite doesn't shrink\n"
+            f"      the file automatically when tables are dropped, "
+            f"so a failed attempt still occupies its full size.\n"
+            f"   2. Free up space on that drive, or point output to "
+            f"a drive with more room:\n"
+            f"        set CLV_DB_PATH=D:\\path\\to\\finance_clv.db "
+            f"   (Windows cmd)\n"
+            f"        $env:CLV_DB_PATH = 'D:\\path\\to\\finance_clv.db' "
+            f"(PowerShell)\n"
+            f"   3. Generate a smaller dataset by lowering "
+            f"N_CUSTOMERS at the top of this script.\n"
+        )
 
 # ── Indian city tiers ─────────────────────────────────────────
 CITY_TIERS = {
@@ -131,15 +184,30 @@ CUSTOMER_SEGMENTS = {
 }
 
 # ── Product types and revenue rates ──────────────────────────
+# "interest_rate" is the borrower-facing rate (used for display /
+# feature engineering only). "margin_rate" is what the BANK actually
+# earns per year on the outstanding value — i.e. the net interest
+# margin (spread over cost of funds) or effective take-rate after
+# provisioning. Using the full borrower-facing rate as revenue
+# massively overstates CLV for anyone holding a large loan, so the
+# CLV computation below always uses margin_rate for lending products.
 PRODUCT_TYPES = {
-    "savings_account"  : {"commission_rate": 0.0,  "interest_rate": 0.0},
-    "fixed_deposit"    : {"commission_rate": 0.005, "interest_rate": 0.0},
-    "recurring_deposit": {"commission_rate": 0.003, "interest_rate": 0.0},
-    "mutual_fund"      : {"commission_rate": 0.01,  "interest_rate": 0.0},
-    "credit_card"      : {"commission_rate": 0.0,   "interest_rate": 0.36},
-    "home_loan"        : {"commission_rate": 0.0,   "interest_rate": 0.085},
-    "personal_loan"    : {"commission_rate": 0.0,   "interest_rate": 0.14},
-    "insurance"        : {"commission_rate": 0.15,  "interest_rate": 0.0},
+    "savings_account"  : {"commission_rate": 0.0,  "interest_rate": 0.0,
+                          "margin_rate": 0.0},
+    "fixed_deposit"    : {"commission_rate": 0.005, "interest_rate": 0.0,
+                          "margin_rate": 0.0},
+    "recurring_deposit": {"commission_rate": 0.003, "interest_rate": 0.0,
+                          "margin_rate": 0.0},
+    "mutual_fund"      : {"commission_rate": 0.01,  "interest_rate": 0.0,
+                          "margin_rate": 0.0},
+    "credit_card"      : {"commission_rate": 0.0,   "interest_rate": 0.36,
+                          "margin_rate": 0.045},  # ~4.5% net on revolving balance
+    "home_loan"        : {"commission_rate": 0.0,   "interest_rate": 0.085,
+                          "margin_rate": 0.0035}, # ~0.35% NIM, secured/low-margin
+    "personal_loan"    : {"commission_rate": 0.0,   "interest_rate": 0.14,
+                          "margin_rate": 0.016},  # ~1.6% NIM, unsecured/higher-margin
+    "insurance"        : {"commission_rate": 0.15,  "interest_rate": 0.0,
+                          "margin_rate": 0.0},
 }
 
 # ── Transaction types ─────────────────────────────────────────
@@ -260,7 +328,7 @@ def monthly_txn_count(segment, city_tier):
 
 
 def compute_clv(customer_row, products_for_customer,
-                label_transactions):
+                label_transactions, precomputed_fee=None):
     """
     Compute actual CLV for a customer over the label period.
 
@@ -273,20 +341,29 @@ def compute_clv(customer_row, products_for_customer,
     6. Minus: operational cost per customer
 
     This mirrors how Indian banks compute relationship value.
+
+    `precomputed_fee`, when provided, is the customer's total
+    transaction-fee revenue already aggregated elsewhere (e.g. via
+    a single grouped SQL query across all customers) — this avoids
+    re-deriving it here by looping row-by-row over that customer's
+    raw transactions, which is far slower at scale.
     """
     clv = 0.0
 
     # ── 1. Transaction fees ───────────────────────────────────
-    for _, txn in label_transactions.iterrows():
-        txn_info = TXN_TYPES.get(txn["txn_type"], {})
-        fee_rate = txn_info.get("fee_rate", 0)
-        amount   = txn.get("amount", 0) or 0
+    if precomputed_fee is not None:
+        clv += precomputed_fee
+    elif label_transactions is not None:
+        for _, txn in label_transactions.iterrows():
+            txn_info = TXN_TYPES.get(txn["txn_type"], {})
+            fee_rate = txn_info.get("fee_rate", 0)
+            amount   = txn.get("amount", 0) or 0
 
-        if fee_rate < 1:  # percentage fee
-            fee = amount * fee_rate
-        else:             # flat fee
-            fee = fee_rate
-        clv += fee
+            if fee_rate < 1:  # percentage fee
+                fee = amount * fee_rate
+            else:             # flat fee
+                fee = fee_rate
+            clv += fee
 
     # ── 2. Product revenue ────────────────────────────────────
     for _, prod in products_for_customer.iterrows():
@@ -297,17 +374,18 @@ def compute_clv(customer_row, products_for_customer,
         value   = prod.get("current_value", 0) or 0
         rates   = PRODUCT_TYPES.get(ptype, {})
 
-        comm_rate     = rates.get("commission_rate", 0)
-        interest_rate = rates.get("interest_rate", 0)
+        comm_rate   = rates.get("commission_rate", 0)
+        margin_rate = rates.get("margin_rate", 0)
 
         if ptype in ["home_loan", "personal_loan", "credit_card"]:
-            # Bank earns interest on outstanding balance
-            # Assume 60% utilization for credit card
+            # Bank earns its NET MARGIN (spread over cost of funds,
+            # after provisioning) on the outstanding balance — not
+            # the full borrower-facing interest rate.
             if ptype == "credit_card":
-                revolving = value * 0.30  # 30% revolve
-                clv += revolving * interest_rate
+                revolving = value * 0.12  # ~12% of limit revolves on average
+                clv += revolving * margin_rate
             else:
-                clv += value * interest_rate
+                clv += value * margin_rate
 
         elif ptype in ["mutual_fund", "fixed_deposit",
                        "recurring_deposit"]:
@@ -518,14 +596,21 @@ def generate_products(customers_df):
                     value = round(
                         income * random.uniform(40, 80), 2
                     )
+                    # Loan-to-income ratios shrink for very high
+                    # earners in practice; cap face value so a single
+                    # ultra-high-income HNI doesn't produce a
+                    # multi-crore loan that dwarfs everything else.
+                    value = min(value, 50_000_000)
                 elif ptype == "personal_loan":
                     value = round(
                         income * random.uniform(5, 20), 2
                     )
+                    value = min(value, 4_000_000)
                 elif ptype == "credit_card":
                     value = round(
                         income * random.uniform(2, 5), 2
                     )  # credit limit
+                    value = min(value, 2_000_000)
                 elif ptype == "mutual_fund":
                     value = round(
                         income * random.uniform(3, 30), 2
@@ -582,7 +667,9 @@ def generate_transactions(customers_df, start_date, end_date,
     """
     print(f"Generating transactions_{table_suffix} table...")
     print(f"  Period: {start_date} to {end_date}")
-    print(f"  Estimated rows: ~{N_CUSTOMERS * 5 * 12:,}")
+    # Rough estimate: ~25 spending txns/month/customer on average
+    # (varies by segment/city tier) + 1 salary credit/month.
+    print(f"  Estimated rows: ~{N_CUSTOMERS * 26 * 12:,}")
 
     if conn is not None:
         table_name = table_name or f"transactions_{table_suffix}"
@@ -745,6 +832,43 @@ def generate_transactions(customers_df, start_date, end_date,
 #  TABLE 4 — CLV LABELS
 # ================================================================
 
+def _transaction_fee_totals(conn, table_name):
+    """
+    Compute total transaction fees per customer for the label
+    period, aggregated in SQL rather than pulled row-by-row.
+
+    Doing this with 50,000 individual per-customer SQL queries
+    (the original approach) dominates total runtime — it's ~80%
+    of wall-clock time even at a few thousand customers, and
+    scales linearly with customer count on top of an already
+    multi-million-row table. Aggregating by (customer_id, txn_type)
+    server-side returns a tiny result set (customers × ≤8 txn
+    types) instead of every raw row, and lets us compute fees with
+    one vectorized pandas pass.
+    """
+    agg = pd.read_sql_query(
+        f"""
+        SELECT customer_id, txn_type,
+               SUM(amount) AS total_amount,
+               COUNT(*)    AS n_txns
+        FROM {table_name}
+        GROUP BY customer_id, txn_type
+        """,
+        conn,
+    )
+
+    def fee_for_row(row):
+        info = TXN_TYPES.get(row["txn_type"], {})
+        fee_rate = info.get("fee_rate", 0)
+        if fee_rate < 1:  # percentage fee
+            return (row["total_amount"] or 0) * fee_rate
+        else:             # flat fee per transaction
+            return fee_rate * row["n_txns"]
+
+    agg["fee"] = agg.apply(fee_for_row, axis=1)
+    return agg.groupby("customer_id")["fee"].sum()
+
+
 def generate_clv_labels(customers_df, products_df,
                          label_transactions_df=None, conn=None,
                          table_name="transactions_label"):
@@ -764,6 +888,12 @@ def generate_clv_labels(customers_df, products_df,
     # Index products for fast lookup
     products_by_cust = products_df.groupby("customer_id")
 
+    # Pre-aggregate transaction fees per customer in one shot
+    # (see _transaction_fee_totals docstring for why).
+    fee_by_customer = None
+    if label_transactions_df is None and conn is not None:
+        fee_by_customer = _transaction_fee_totals(conn, table_name)
+
     records = []
     for _, cust in customers_clean.iterrows():
         cust_id = cust["customer_id"]
@@ -773,20 +903,20 @@ def generate_clv_labels(customers_df, products_df,
             if cust_id in products_by_cust.groups else \
             pd.DataFrame()
 
-        if label_transactions_df is not None:
+        if fee_by_customer is not None:
+            precomputed_fee = fee_by_customer.get(cust_id, 0.0)
+            label_txns = None
+        elif label_transactions_df is not None:
             label_txns = label_transactions_df.loc[
                 label_transactions_df["customer_id"] == cust_id
             ].copy()
-        elif conn is not None:
-            label_txns = pd.read_sql_query(
-                f"SELECT * FROM {table_name} WHERE customer_id = ?",
-                conn,
-                params=(cust_id,),
-            )
+            precomputed_fee = None
         else:
             label_txns = pd.DataFrame()
+            precomputed_fee = None
 
-        clv = compute_clv(cust, prods, label_txns)
+        clv = compute_clv(cust, prods, label_txns,
+                           precomputed_fee=precomputed_fee)
 
         # Segment-based adjustment to ensure realistic distribution
         segment = cust["segment"]
@@ -800,6 +930,12 @@ def generate_clv_labels(customers_df, products_df,
         # Add more zeros/near-zeros for realism
         if random.random() < 0.05:
             clv = round(random.uniform(0, 200), 2)
+
+        # Winsorize: even real bank CLV models cap a handful of rare
+        # extreme outliers (e.g. one customer with an oversized loan)
+        # rather than let them dominate the target distribution. This
+        # should rarely bind — it's a safety net, not a routine ceiling.
+        clv = min(clv, 900_000.0)
 
         records.append({
             "customer_id"         : cust_id,
@@ -902,7 +1038,7 @@ def main():
     print(" Processing     : PySpark + SQLite")
     print("=" * 65)
     print(f" Customers      : {N_CUSTOMERS:,}")
-    print(f" Expected txns  : ~{N_CUSTOMERS * 5 * 12:,}")
+    print(f" Expected txns  : ~{N_CUSTOMERS * 26 * 12:,}")
     print(f" Database       : {os.path.abspath(DB_PATH)}")
     print("=" * 65)
 
@@ -916,6 +1052,8 @@ def main():
         except sqlite3.OperationalError:
             target_db_path = DB_FALLBACK_PATH
             print(f"  Using alternate database path: {target_db_path}")
+
+    check_disk_space(target_db_path, N_CUSTOMERS)
 
     conn = sqlite3.connect(target_db_path, timeout=60.0)
     conn.execute("PRAGMA busy_timeout = 60000")
