@@ -4,10 +4,13 @@ __pycache__/
 .ipynb_checkpoints/
 *.csv
 *.xlsx
-data/raw/
-data/processed/
+**/data/raw/
+**/data/processed/
 # Model files
 models/
 *.pkl
 *.joblib
 *.h5
+# Spark temporary files
+**/spark_temp/
+**/blockmgr-*/
