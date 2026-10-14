@@ -354,7 +354,7 @@ from people who just report numbers.
 | Domain | Projects Done | Planned |
 |---|---|---|
 | Ride Sharing | 5 | 5 ✅ |
-| Finance | 1 | 4 |
+| Finance | 2 | 4 |
 | Healthcare | 0 | 3 |
 | **Total** | **6** | **12** |
 
