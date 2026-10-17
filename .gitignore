@@ -16,3 +16,4 @@ models/
 **/blockmgr-*/
 # Generated database
 finance/loan_default_risk/data/*.db
+finance/insurance_claim_prediction/data/*.db
